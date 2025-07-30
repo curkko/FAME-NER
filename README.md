@@ -1,4 +1,4 @@
-# CLCNER_model
+# Me2NER
 ### Requirements
 
 - python 3.9
