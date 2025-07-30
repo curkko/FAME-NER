@@ -4,7 +4,7 @@
 - python 3.9
 - pytorch 1.9.0+cu111
 - transformers 4.10.0
-- CLCNER dataset
+- CLC-NERD dataset
 
 Other pip package show in `requirements.txt`.
 
