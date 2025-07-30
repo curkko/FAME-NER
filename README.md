@@ -22,4 +22,4 @@ bash run.sh
 
 ## Datasets
 
-We use the CLCNER dataset labeled by ourselves
+We use the CLC-NERD dataset labeled by ourselves
