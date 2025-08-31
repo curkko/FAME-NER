@@ -3,11 +3,56 @@ from copy import deepcopy
 import torch
 import torch.nn as nn
 from torch.nn import CrossEntropyLoss
+import torch.nn.functional as F
+import numpy as np
 
 from transformers import BertForTokenClassification
 
-
 logger = logging.getLogger(__file__)
+
+
+# 添加NaiveFourierKANLayer类
+class NaiveFourierKANLayer(nn.Module):
+    def __init__(self, inputdim, outdim, gridsize, addbias=True, smooth_initialization=True):
+        super(NaiveFourierKANLayer, self).__init__()
+        self.gridsize = gridsize
+        self.addbias = addbias
+        self.inputdim = inputdim
+        self.outdim = outdim
+
+        # With smooth_initialization, fourier coefficients are attenuated by the square of their frequency.
+        # This makes KAN's scalar functions smooth at initialization.
+        # Without smooth_initialization, high gridsizes will lead to high-frequency scalar functions,
+        # with high derivatives and low correlation between similar inputs.
+        grid_norm_factor = (torch.arange(gridsize) + 1) ** 2 if smooth_initialization else np.sqrt(gridsize)
+
+        # The normalization has been chosen so that if given inputs where each coordinate is of unit variance,
+        # then each coordinates of the output is of unit variance
+        # independently of the various sizes
+        self.fouriercoeffs = nn.Parameter(torch.randn(2, outdim, inputdim, gridsize) /
+                                          (np.sqrt(inputdim) * grid_norm_factor))
+        if (self.addbias):
+            self.bias = nn.Parameter(torch.zeros(1, outdim))
+
+    # x.shape ( ... , indim )
+    # out.shape ( ..., outdim)
+    def forward(self, x):
+        xshp = x.shape
+        outshape = xshp[0:-1] + (self.outdim,)
+        x = torch.reshape(x, (-1, self.inputdim))
+        # Starting at 1 because constant terms are in the bias
+        k = torch.reshape(torch.arange(1, self.gridsize + 1, device=x.device), (1, 1, 1, self.gridsize))
+        xrshp = torch.reshape(x, (x.shape[0], 1, x.shape[1], 1))
+        # This should be fused to avoid materializing memory
+        c = torch.cos(k * xrshp)
+        s = torch.sin(k * xrshp)
+        # We compute the interpolation of the various functions defined by their fourier coefficient for each input coordinates and we sum them
+        y = torch.sum(c * self.fouriercoeffs[0:1], (-2, -1))
+        y += torch.sum(s * self.fouriercoeffs[1:2], (-2, -1))
+        if (self.addbias):
+            y += self.bias
+        y = torch.reshape(y, outshape)
+        return y
 
 
 class BertForTokenClassification_(BertForTokenClassification):
@@ -18,66 +63,121 @@ class BertForTokenClassification_(BertForTokenClassification):
         self.type_loss = nn.functional.cross_entropy
         self.dropout = nn.Dropout(p=0.1)
         self.log_softmax = nn.functional.log_softmax
-        
-        
 
     def set_config(
-        self,
-        use_classify: bool = False,
-        distance_mode: str = "cos",
-        similar_k: float = 30,
-        shared_bert: bool = True,
-        train_mode: str = "add",
+            self,
+            use_classify: bool = False,
+            distance_mode: str = "cos",
+            similar_k: float = 30,
+            shared_bert: bool = True,
+            train_mode: str = "add",
+            # FourierKAN相关参数
+            use_fourier_kan: bool = False,
+            kan_gridsize: int = 300,
+            kan_smooth_init: bool = True,
+            # 对比损失相关参数
+            use_contrastive_loss: bool = False,
+            contrastive_temperature: float = 0.1,
+            contrastive_lambda: float = 1.0,
     ):
         self.use_classify = use_classify
         self.distance_mode = distance_mode
         self.similar_k = similar_k
         self.shared_bert = shared_bert
         self.train_mode = train_mode
+        self.use_fourier_kan = use_fourier_kan
+        self.kan_gridsize = kan_gridsize
+        self.kan_smooth_init = kan_smooth_init
+        # 对比损失相关参数
+        self.use_contrastive_loss = use_contrastive_loss
+        self.contrastive_temperature = contrastive_temperature
+        self.contrastive_lambda = contrastive_lambda
+
         if train_mode == "type":
             self.classifier = None
 
-
         if train_mode != "span":
             self.ln = nn.LayerNorm(768, 1e-5, True)
+
             if use_classify:
-                # self.type_classify = nn.Linear(self.input_size, self.input_size)
-                self.type_classify = nn.Sequential(
-                    nn.Linear(self.input_size, self.input_size * 2),
-                    nn.GELU(),
-                    nn.Linear(self.input_size * 2, self.input_size),
-                )
+                if use_fourier_kan:
+                    # FourierKAN
+                    self.type_classify = nn.Sequential(
+                        NaiveFourierKANLayer(
+                            inputdim=self.input_size,
+                            outdim=self.input_size * 2,
+                            gridsize=kan_gridsize,
+                            addbias=True,
+                            smooth_initialization=kan_smooth_init
+                        ),
+                        nn.GELU(),
+                        NaiveFourierKANLayer(
+                            inputdim=self.input_size * 2,
+                            outdim=self.input_size,
+                            gridsize=kan_gridsize,
+                            addbias=True,
+                            smooth_initialization=kan_smooth_init
+                        ),
+                    )
+                else:
+                    # MLP
+                    self.type_classify = nn.Sequential(
+                        nn.Linear(self.input_size, self.input_size * 2),
+                        nn.GELU(),
+                        nn.Linear(self.input_size * 2, self.input_size),
+                    )
+
             if self.distance_mode != "cos":
-                self.dis_cls = nn.Sequential(
-                    nn.Linear(self.input_size * 3, self.input_size),
-                    nn.GELU(),
-                    nn.Linear(self.input_size, 2),
-                )
+                if use_fourier_kan:
+                    self.dis_cls = nn.Sequential(
+                        NaiveFourierKANLayer(
+                            inputdim=self.input_size * 3,
+                            outdim=self.input_size,
+                            gridsize=kan_gridsize,
+                            addbias=True,
+                            smooth_initialization=kan_smooth_init
+                        ),
+                        nn.GELU(),
+                        nn.Linear(self.input_size, 2),  # 最后一层保持Linear，输出维度较小
+                    )
+                else:
+                    self.dis_cls = nn.Sequential(
+                        nn.Linear(self.input_size * 3, self.input_size),
+                        nn.GELU(),
+                        nn.Linear(self.input_size, 2),
+                    )
+
         config = {
             "use_classify": use_classify,
             "distance_mode": distance_mode,
             "similar_k": similar_k,
             "shared_bert": shared_bert,
             "train_mode": train_mode,
+            "use_fourier_kan": use_fourier_kan,
+            "kan_gridsize": kan_gridsize,
+            "kan_smooth_init": kan_smooth_init,
+            "use_contrastive_loss": use_contrastive_loss,
+            "contrastive_temperature": contrastive_temperature,
+            "contrastive_lambda": contrastive_lambda,
         }
         logger.info(f"Model Setting: {config}")
         if not shared_bert:
             self.bert2 = deepcopy(self.bert)
 
     def forward_lyl(
-        self,
-        input_ids,
-        attention_mask=None,
-        token_type_ids=None,
-        labels=None,
-        e_mask=None,
-        e_type_ids=None,
-        e_type_mask=None,
-        entity_types=None,
-        entity_mode: str = "mean",
-        is_update_type_embedding: bool = False,
-        lambda_max_loss: float = 0.0,
-        sim_k: float = 0,
+            self,
+            input_ids,
+            attention_mask=None,
+            token_type_ids=None,
+            labels=None,
+            e_mask=None,
+            e_type_ids=None,
+            e_type_mask=None,
+            entity_types=None,
+            entity_mode: str = "mean",
+            is_update_type_embedding: bool = False,
+            lambda_max_loss: float = 0.0,
+            sim_k: float = 0,
     ):
         max_len = (attention_mask != 0).max(0)[0].nonzero(as_tuple=False)[-1].item() + 1
         input_ids = input_ids[:, :max_len]
@@ -104,8 +204,8 @@ class BertForTokenClassification_(BertForTokenClassification):
         if e_type_ids is not None and self.train_mode != "span":
             if e_type_mask.sum() != 0:
                 M = (e_type_mask[:, :, 0] != 0).max(0)[0].nonzero(as_tuple=False)[
-                    -1
-                ].item() + 1
+                        -1
+                    ].item() + 1
             else:
                 M = 1
             e_mask = e_mask[:, :M, :max_len].type(torch.int8)
@@ -117,9 +217,18 @@ class BertForTokenClassification_(BertForTokenClassification):
                 e_mask,
                 entity_mode,
             )
+            # FourierKAN用于span表示增强
             if self.use_classify:
                 e_out = self.type_classify(e_out)
             e_out = self.ln(e_out)  # batch_size x max_entity_num x hidden_size
+
+            # 计算对比损失（在归一化后的span表示上）
+            contrastive_loss = None
+            if self.use_contrastive_loss and self.training:
+                contrastive_loss = self.compute_contrastive_loss(
+                    e_out, e_type_ids, e_type_mask
+                )
+
             if is_update_type_embedding:
                 entity_types.update_type_embedding(e_out, e_type_ids, e_type_mask)
             e_out = e_out.unsqueeze(2).expand(B, M, K, -1)
@@ -146,6 +255,10 @@ class BertForTokenClassification_(BertForTokenClassification):
                 type_loss = self.calc_loss(
                     self.type_loss, e, e_type_label, e_type_mask[:, :, 0]
                 )
+
+                # 将对比损失加入到type_loss中
+                if contrastive_loss is not None:
+                    type_loss = type_loss + self.contrastive_lambda * contrastive_loss
             else:
                 type_loss = torch.tensor(0).to(sequence_output.device)
         else:
@@ -181,8 +294,80 @@ class BertForTokenClassification_(BertForTokenClassification):
 
         return logits, e_logits, loss, type_loss
 
+    def compute_contrastive_loss(self, span_embeddings, e_type_ids, e_type_mask):
+        B, M, H = span_embeddings.shape
+        B, M, K = e_type_ids.shape
+
+        # 只计算有效entity的对比损失
+        valid_entities = e_type_mask[:, :, 0] > 0  # [B, M]
+
+        if valid_entities.sum() == 0:
+            return torch.tensor(0.0, device=span_embeddings.device)
+
+        # 获取有效的span表示和对应的类型标签
+        valid_span_embeddings = span_embeddings[valid_entities]  # [N, H] where N = valid entities
+        valid_type_ids = e_type_ids[valid_entities]  # [N, K]
+        valid_type_masks = e_type_mask[valid_entities]  # [N, K]
+
+        N = valid_span_embeddings.shape[0]
+        if N < 2:  # 至少需要2个实体才能计算对比损失
+            return torch.tensor(0.0, device=span_embeddings.device)
+
+        # L2归一化span embeddings用于余弦相似度计算
+        span_embeddings_norm = F.normalize(valid_span_embeddings, p=2, dim=1)  # [N, H]
+
+        # 计算所有span pair之间的余弦相似度
+        similarity_matrix = torch.mm(span_embeddings_norm, span_embeddings_norm.t())  # [N, N]
+
+        # 获取正样本标签（每个entity的第一个type_id作为正样本）
+        positive_labels = valid_type_ids[:, 0]  # [N]
+
+        # 创建正样本mask: 相同类型的entity pair
+        positive_mask = (positive_labels.unsqueeze(0) == positive_labels.unsqueeze(1)).float()  # [N, N]
+        # 移除对角线（自己与自己）
+        positive_mask = positive_mask - torch.eye(N, device=positive_mask.device)
+
+        # 对比损失计算
+        contrastive_losses = []
+
+        for i in range(N):
+            # 对于第i个span，找到所有正样本
+            pos_mask_i = positive_mask[i]  # [N]
+
+            if pos_mask_i.sum() == 0:  # 如果没有正样本，跳过
+                continue
+
+            # 计算与所有其他span的相似度
+            sim_i = similarity_matrix[i]  # [N]
+
+            # 应用温度参数
+            sim_i = sim_i / self.contrastive_temperature
+
+            # 计算正样本的平均log概率
+            # 对于每个正样本，计算其在所有样本中的softmax概率
+            exp_sim = torch.exp(sim_i)  # [N]
+
+            # 为每个正样本计算对比损失
+            pos_indices = torch.nonzero(pos_mask_i, as_tuple=True)[0]
+            for pos_idx in pos_indices:
+                # 分子：与正样本的相似度
+                numerator = exp_sim[pos_idx]
+                # 分母：与所有样本（除自己）的相似度之和
+                denominator_mask = torch.ones(N, device=exp_sim.device)
+                denominator_mask[i] = 0  # 排除自己
+                denominator = torch.sum(exp_sim * denominator_mask)
+
+                if denominator > 0:
+                    loss_i = -torch.log(numerator / (denominator + 1e-8))
+                    contrastive_losses.append(loss_i)
+
+        if len(contrastive_losses) == 0:
+            return torch.tensor(0.0, device=span_embeddings.device)
+
+        return torch.stack(contrastive_losses).mean()
+
     def get_enity_hidden(
-        self, hidden: torch.Tensor, e_mask: torch.Tensor, entity_mode: str
+            self, hidden: torch.Tensor, e_mask: torch.Tensor, entity_mode: str
     ):
         B, M, T = e_mask.shape
         e_out = hidden.unsqueeze(1).expand(B, M, T, -1) * e_mask.unsqueeze(
@@ -190,7 +375,7 @@ class BertForTokenClassification_(BertForTokenClassification):
         )  # batch_size x max_entity_num x seq_len x hidden_size
         if entity_mode == "mean":
             return e_out.sum(2) / (
-                e_mask.sum(-1).unsqueeze(-1) + 1e-30
+                    e_mask.sum(-1).unsqueeze(-1) + 1e-30
             )  # batch_size x max_entity_num x hidden_size
 
     def get_types_embedding(self, e_type_ids: torch.Tensor, entity_types):
@@ -210,10 +395,10 @@ class BertForTokenClassification_(BertForTokenClassification):
 
 class ViterbiDecoder(object):
     def __init__(
-        self,
-        id2label,
-        transition_matrix,
-        ignore_token_label_id=torch.nn.CrossEntropyLoss().ignore_index,
+            self,
+            id2label,
+            transition_matrix,
+            ignore_token_label_id=torch.nn.CrossEntropyLoss().ignore_index,
     ):
         self.id2label = id2label
         self.n_labels = len(id2label)
@@ -227,7 +412,7 @@ class ViterbiDecoder(object):
         label_ids = label_ids[:, :max_seq_len]
 
         active_tokens = (attention_mask == 1) & (
-            label_ids != self.ignore_token_label_id
+                label_ids != self.ignore_token_label_id
         )
         if n_labels != self.n_labels:
             raise ValueError("Labels do not match!")
