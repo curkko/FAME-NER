@@ -1,4 +1,4 @@
-# Me2NER
+# FAME-NER
 ### Requirements
 
 - python 3.9
